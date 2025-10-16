@@ -10,9 +10,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import aiohttp
 import yaml
 
-
-GITHUB_RE = re.compile(r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/#]+)(?:/.*)?$")
-
+# Regex to support multiple Git hosting platforms.
+GITHUB_RE = re.compile(
+    r"^https?://(github\.com|git\.kernel\.org|codeberg\.org|gitlab\.com|sr\.ht|go\.googlesource\.com|gopkg\.in|cloud\.google\.com)/(?P<owner>[^/]+)/(?P<repo>[^/#]+)(?:/.*)?$"
+)
 
 @dataclass
 class RepoRef:
@@ -20,17 +21,14 @@ class RepoRef:
     owner: str
     repo: str
 
-
 def parse_repo(url: str) -> Optional[RepoRef]:
     m = GITHUB_RE.match(url)
     if m:
-        return RepoRef(host="github", owner=m.group("owner"), repo=m.group("repo"))
+        return RepoRef(host=m.group(1), owner=m.group("owner"), repo=m.group("repo"))
     return None
-
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 class GitHubClient:
     def __init__(self, token: Optional[str], concurrency: int = 8, timeout_s: int = 20):
@@ -38,6 +36,8 @@ class GitHubClient:
         self._sem = asyncio.Semaphore(concurrency)
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._session: Optional[aiohttp.ClientSession] = None
+        self.success_count = 0
+        self.failure_count = 0
 
     async def __aenter__(self):
         headers = {"Accept": "application/vnd.github+json"}
@@ -55,42 +55,38 @@ class GitHubClient:
         async with self._sem:
             async with self._session.get(url) as resp:
                 data = await resp.json(content_type=None)
-                rate = {
+                rate_info = {
                     "x-ratelimit-limit": resp.headers.get("x-ratelimit-limit"),
                     "x-ratelimit-remaining": resp.headers.get("x-ratelimit-remaining"),
                     "x-ratelimit-reset": resp.headers.get("x-ratelimit-reset"),
                     "status": resp.status,
                 }
+                if resp.status == 429:  # Handle rate limiting
+                    self.failure_count += 1
+                    await asyncio.sleep(25)  # Wait before retrying
+                    return await self._get_json(url)  # Retry the request
                 if resp.status >= 400:
+                    self.failure_count += 1
                     raise RuntimeError(f"HTTP {resp.status} for {url}: {data}")
-                return data, rate
+                self.success_count += 1
+                return data, rate_info
 
     async def get_default_branch(self, ref: RepoRef) -> Tuple[str, Dict[str, Any]]:
         data, rate = await self._get_json(f"https://api.github.com/repos/{ref.owner}/{ref.repo}")
         return data.get("default_branch", "main"), rate
 
     async def get_tree_paths(self, ref: RepoRef, branch: str) -> Tuple[Set[str], Dict[str, Any]]:
-        data, rate = await self._get_json(
-            f"https://api.github.com/repos/{ref.owner}/{ref.repo}/git/trees/{branch}?recursive=1"
-        )
-        paths = set()
-        for item in data.get("tree", []):
-            p = item.get("path")
-            if p:
-                paths.add(p)
+        data, rate = await self._get_json(f"https://api.github.com/repos/{ref.owner}/{ref.repo}/git/trees/{branch}?recursive=1")
+        paths = {item.get("path") for item in data.get("tree", []) if item.get("path")}
         return paths, rate
 
     async def get_rate_limit_remaining(self) -> Optional[int]:
         try:
             data, _ = await self._get_json("https://api.github.com/rate_limit")
             core = data.get("resources", {}).get("core", {})
-            remaining = core.get("remaining")
-            if isinstance(remaining, int):
-                return remaining
-            return None
+            return core.get("remaining")
         except Exception:
             return None
-
 
 def detect_build_systems(paths: Set[str]) -> Tuple[Dict[str, bool], Dict[str, Any]]:
     # Normalize to lowercase for comparisons where applicable
@@ -176,7 +172,6 @@ def detect_build_systems(paths: Set[str]) -> Tuple[Dict[str, bool], Dict[str, An
 
     return booleans, meta
 
-
 async def enrich_entry(entry: Dict[str, Any], gh: GitHubClient) -> Dict[str, Any]:
     url = entry.get("url")
     if not isinstance(url, str):
@@ -184,13 +179,13 @@ async def enrich_entry(entry: Dict[str, Any], gh: GitHubClient) -> Dict[str, Any
 
     reporef = parse_repo(url)
     if not reporef:
-        # Non-GitHub URLs unsupported for now; annotate minimal info
         entry.setdefault("build_metadata", {})
         entry["build_metadata"].update({
             "repo_host": "unknown",
-            "note": "Non-GitHub repositories not yet supported",
+            "note": "Non-supported repository host.",
             "detection_timestamp": now_iso(),
         })
+        print(f"Failed to process URL: {url} - Non-supported repository host.")
         return entry
 
     try:
@@ -198,7 +193,6 @@ async def enrich_entry(entry: Dict[str, Any], gh: GitHubClient) -> Dict[str, Any
         paths, rate_tree = await gh.get_tree_paths(reporef, default_branch)
         booleans, meta = detect_build_systems(paths)
 
-        # Update entry preserving existing keys
         for k, v in booleans.items():
             entry[k] = v
 
@@ -212,6 +206,8 @@ async def enrich_entry(entry: Dict[str, Any], gh: GitHubClient) -> Dict[str, Any
             "api_rate_limit_remaining": rate_tree.get("x-ratelimit-remaining"),
             **meta,
         })
+        
+        print(f"Successfully processed URL: {url}")
         return entry
     except Exception as e:
         entry.setdefault("build_metadata", {})
@@ -222,6 +218,7 @@ async def enrich_entry(entry: Dict[str, Any], gh: GitHubClient) -> Dict[str, Any
             "error": str(e),
             "detection_timestamp": now_iso(),
         })
+        print(f"Failed to process URL: {url} - Error: {str(e)}")
         return entry
 
 
@@ -266,7 +263,6 @@ async def process_file(path: str, token: Optional[str], concurrency: int) -> Non
             allow_unicode=True,
         )
 
-
 def main(argv: List[str]) -> int:
     import argparse
 
@@ -282,10 +278,13 @@ def main(argv: List[str]) -> int:
         print(f"YAML file not found: {yaml_path}", file=sys.stderr)
         return 2
 
-    asyncio.run(process_file(yaml_path, token=args.token, concurrency=args.concurrency))
-    print(f"Updated {yaml_path}")
-    return 0
+    async def run_process():
+        async with GitHubClient(token=args.token, concurrency=args.concurrency) as gh:
+            await process_file(yaml_path, token=args.token, concurrency=args.concurrency)
+            print(f"Updated {yaml_path} with {gh.success_count} successful calls and {gh.failure_count} failed calls.")
 
+    asyncio.run(run_process())
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
