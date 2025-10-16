@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: repo-runner
+Version: 0.1.0
+Summary: Clone GitHub repos, fetch metadata, and run commands.
+Requires-Python: >=3.9
+Requires-Dist: requests>=2.31.0
+Requires-Dist: gitpython>=3.1.43
+Requires-Dist: aiohttp>=3.9.0
+Requires-Dist: PyYAML>=6.0.1

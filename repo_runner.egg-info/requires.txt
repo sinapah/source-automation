@@ -1,0 +1,4 @@
+requests>=2.31.0
+gitpython>=3.1.43
+aiohttp>=3.9.0
+PyYAML>=6.0.1
